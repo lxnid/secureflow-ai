@@ -11,6 +11,7 @@ from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 
 from src.config import Settings
+from src.plugins.compliance_plugin import CompliancePlugin
 from src.plugins.pattern_plugin import PatternPlugin
 from src.plugins.risk_plugin import RiskScorerPlugin
 
@@ -34,9 +35,10 @@ line_start, line_end, code_snippet, vuln_type, tool.
      "This is an internal utility function"). Use the file path, code snippet,
      and description to infer context.
 
-2. For each finding that scores CRITICAL or HIGH priority, call `get_team_patterns` with:
-   - `vuln_type`: the finding's vuln_type
-   - `language`: infer from the file extension
+2. For each finding that scores CRITICAL or HIGH priority:
+   a. Call `get_team_patterns` with `vuln_type` and `language` (infer from file extension).
+   b. Call `map_compliance` with the finding's `cwe_id` to identify which compliance
+      frameworks are affected (SOC2, PCI-DSS, OWASP, HIPAA).
 
 3. Filter findings:
    - KEEP: findings with priority CRITICAL or HIGH
@@ -46,7 +48,8 @@ line_start, line_end, code_snippet, vuln_type, tool.
 4. For each kept finding, enrich it with:
    - The risk assessment rationale
    - Team fix patterns (if any were found)
-   - Business impact explanation (1-2 sentences)
+   - Compliance frameworks affected (from map_compliance)
+   - Business impact explanation (1-2 sentences, referencing specific compliance requirements)
 
 ## Output Format
 
@@ -84,6 +87,7 @@ Return a JSON object:
           "framework": "SQLAlchemy"
         }
       ],
+      "compliance": ["SOC2 CC6.1", "PCI-DSS 6.5.1", "OWASP A03:2021"],
       "business_impact": "This SQL injection in the payment endpoint could allow attackers to extract customer payment data, violating PCI-DSS 6.5.1."
     }
   ],
@@ -116,7 +120,10 @@ def create_intelligence_agent(
         api_key=settings.azure_openai_api_key,
     )
 
-    plugins: list = [RiskScorerPlugin()]
+    plugins: list = [
+        RiskScorerPlugin(),
+        CompliancePlugin(cosmos_client, settings.cosmos_database),
+    ]
     if cosmos_client:
         plugins.append(PatternPlugin(cosmos_client, settings.cosmos_database))
 

@@ -74,6 +74,7 @@ Return a JSON object with this exact structure:
 def create_scanner_agent(
     settings: Settings,
     github_plugin: GitHubPlugin | None = None,
+    mcp_plugin=None,
 ) -> ChatCompletionAgent:
     """Create the Scanner ChatCompletionAgent with SAST plugins.
 
@@ -81,6 +82,8 @@ def create_scanner_agent(
         settings: Application settings.
         github_plugin: Optional shared GitHubPlugin. If not provided,
             a new instance is created (caller is responsible for closing it).
+        mcp_plugin: Optional MCPStdioPlugin for GitHub MCP server.
+            Provides supplementary search/repo capabilities.
     """
     service = AzureChatCompletion(
         deployment_name=settings.azure_openai_deployment,
@@ -89,9 +92,12 @@ def create_scanner_agent(
     )
     if github_plugin is None:
         github_plugin = GitHubPlugin(settings.github_token)
+    plugins = [SemgrepPlugin(), github_plugin]
+    if mcp_plugin is not None:
+        plugins.append(mcp_plugin)
     return ChatCompletionAgent(
         service=service,
         name="SecurityScanner",
         instructions=SCANNER_SYSTEM_PROMPT,
-        plugins=[SemgrepPlugin(), github_plugin],
+        plugins=plugins,
     )

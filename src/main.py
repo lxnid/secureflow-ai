@@ -6,6 +6,7 @@ the multi-agent security review pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -27,6 +28,12 @@ logger = logging.getLogger("secureflow")
 
 settings = Settings()
 
+# Rate limiter: max concurrent pipeline analyses
+_analysis_semaphore: asyncio.Semaphore | None = None
+
+# Max diff size we'll process (100 KB)
+_MAX_BODY_SIZE = 200_000  # bytes (webhook payload, not just diff)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +43,17 @@ async def lifespan(app: FastAPI):
         format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
     )
     logger.info("SecureFlow AI starting up")
+
+    # Initialize OpenTelemetry tracing
+    from src.telemetry import init_telemetry
+
+    init_telemetry(
+        appinsights_connection_string=settings.appinsights_connection_string,
+    )
+
+    # Initialize rate limiter
+    global _analysis_semaphore
+    _analysis_semaphore = asyncio.Semaphore(settings.max_concurrent_analyses)
 
     # Initialize Cosmos DB client for knowledge base (patterns, evidence)
     cosmos_client = None
@@ -89,6 +107,13 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     # 1. Read raw body for signature verification
     body = await request.body()
 
+    # 1b. Input validation: reject oversized payloads
+    if len(body) > _MAX_BODY_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large ({len(body)} bytes, max {_MAX_BODY_SIZE})",
+        )
+
     # 2. Verify webhook signature
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not _verify_signature(body, signature, settings.github_webhook_secret):
@@ -106,10 +131,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     action = payload.get("action", "")
-    if action not in ("opened", "synchronize"):
-        return {"status": "ignored", "reason": f"Action '{action}' not handled"}
 
-    # 5. Extract PR details with validation
+    # 4b. Parse payload structure (shared across action types)
     try:
         pr = payload["pull_request"]
         repo = payload["repository"]["full_name"]
@@ -118,13 +141,30 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     except (KeyError, TypeError) as e:
         raise HTTPException(status_code=422, detail=f"Invalid payload structure: missing {e}")
 
+    cosmos_client = getattr(request.app.state, "cosmos_client", None)
+
+    # 5. Handle PR closed events → learning loop (update pattern confidence)
+    if action == "closed":
+        merged = pr.get("merged", False)
+        logger.info(
+            "PR #%d on %s closed (merged=%s) — updating knowledge base",
+            pr_number, repo, merged,
+        )
+        if cosmos_client:
+            background_tasks.add_task(
+                _record_fix_outcomes, repo, pr_number, merged, cosmos_client,
+            )
+        return {"status": "accepted", "action": "learning_loop", "merged": merged}
+
+    # 6. Handle PR opened/synchronize → trigger security review pipeline
+    if action not in ("opened", "synchronize"):
+        return {"status": "ignored", "reason": f"Action '{action}' not handled"}
+
     logger.info(
         "Processing PR #%d on %s (action=%s, sha=%s)",
         pr_number, repo, action, head_sha[:8],
     )
 
-    # 6. Trigger pipeline in background (pass Cosmos client for knowledge base)
-    cosmos_client = getattr(request.app.state, "cosmos_client", None)
     background_tasks.add_task(process_pr, repo, pr_number, head_sha, cosmos_client)
 
     return {
@@ -132,6 +172,64 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         "repo": repo,
         "pr_number": pr_number,
     }
+
+
+async def _record_fix_outcomes(
+    repo: str, pr_number: int, merged: bool, cosmos_client,
+) -> None:
+    """Update knowledge base patterns based on whether the PR was merged.
+
+    When a PR with our suggestions is merged, we mark those fix patterns
+    as accepted. When closed without merge, we mark them as rejected.
+    This creates a feedback loop that improves pattern confidence over time.
+    """
+    from src.plugins.pattern_plugin import PatternPlugin
+
+    try:
+        plugin = PatternPlugin(cosmos_client, settings.cosmos_database)
+
+        # Query the findings container for fixes we posted on this PR
+        db = cosmos_client.get_database_client(settings.cosmos_database)
+        findings_container = db.get_container_client("findings")
+        query = (
+            "SELECT c.fixes FROM c "
+            "WHERE c.pr_number = @pr_number AND c.repo = @repo"
+        )
+        params = [
+            {"name": "@pr_number", "value": pr_number},
+            {"name": "@repo", "value": repo},
+        ]
+        results = [
+            item async for item in findings_container.query_items(
+                query=query, parameters=params,
+            )
+        ]
+
+        fix_count = 0
+        for result in results:
+            for fix in result.get("fixes", []):
+                vuln_type = fix.get("vuln_type", "")
+                language = fix.get("language", "python")
+                fix_pattern = fix.get("explanation", "")
+                framework = fix.get("framework", "")
+                if vuln_type and fix_pattern:
+                    await plugin.store_fix_outcome(
+                        vuln_type=vuln_type,
+                        fix_pattern=fix_pattern,
+                        language=language,
+                        accepted=merged,
+                        repo=repo,
+                        framework=framework,
+                    )
+                    fix_count += 1
+
+        logger.info(
+            "Learning loop: updated %d pattern(s) for PR #%d (merged=%s)",
+            fix_count, pr_number, merged,
+        )
+
+    except Exception:
+        logger.exception("Learning loop failed for PR #%d", pr_number)
 
 
 async def process_pr(
@@ -143,7 +241,29 @@ async def process_pr(
     The Remediation Agent posts inline suggestions and comments directly
     to the PR via its GitHubPlugin. If the pipeline fails, we post
     a fallback error comment.
+
+    Rate-limited by _analysis_semaphore to prevent resource exhaustion.
     """
+    from src.orchestrator import SecurityReviewOrchestrator
+    from src.plugins.github_plugin import GitHubPlugin
+
+    # Rate limiting: wait for a semaphore slot
+    if _analysis_semaphore is not None:
+        if _analysis_semaphore.locked():
+            logger.warning(
+                "Rate limit: %d concurrent analyses running, PR #%d is queued",
+                settings.max_concurrent_analyses, pr_number,
+            )
+
+    sem = _analysis_semaphore or asyncio.Semaphore(1)
+    async with sem:
+        await _run_pipeline(repo, pr_number, head_sha, cosmos_client)
+
+
+async def _run_pipeline(
+    repo: str, pr_number: int, head_sha: str, cosmos_client=None,
+) -> None:
+    """Inner pipeline execution, called within the rate-limiting semaphore."""
     from src.orchestrator import SecurityReviewOrchestrator
     from src.plugins.github_plugin import GitHubPlugin
 
@@ -194,6 +314,18 @@ def _format_pipeline_comment(result: dict, duration: float) -> str:
         "MEDIUM": ":yellow_circle:",
         "LOW": ":white_circle:",
     }
+
+    # Handle partial results from circuit breaker
+    if result.get("partial"):
+        failed = result.get("failed_stage", "unknown")
+        raw = result.get("raw_output", "")
+        return (
+            "## :warning: SecureFlow AI — Partial Analysis Results\n\n"
+            f"The **{failed}** agent encountered an error. "
+            f"Showing results from earlier pipeline stages.\n\n"
+            f"{raw[:3000]}\n\n"
+            f"_Partial analysis completed in {duration:.1f}s_"
+        )
 
     # Handle unparseable output
     if result.get("parse_error"):
@@ -279,6 +411,37 @@ def _format_pipeline_comment(result: dict, duration: float) -> str:
             if impact:
                 lines.append(f"> {impact}")
             lines.append("")
+
+    # Compliance impact (aggregate affected frameworks from prioritized findings)
+    compliance_frameworks: dict[str, set[str]] = {}
+    for pf in prioritized:
+        for comp in pf.get("compliance", []):
+            # comp format: "SOC2 CC6.1" or {"framework": "SOC2", "requirement": "CC6.1"}
+            if isinstance(comp, str):
+                parts = comp.split(" ", 1)
+                fw = parts[0]
+                req = parts[1] if len(parts) > 1 else ""
+            elif isinstance(comp, dict):
+                fw = comp.get("framework", "")
+                req = comp.get("requirement", "")
+            else:
+                continue
+            if fw:
+                if fw not in compliance_frameworks:
+                    compliance_frameworks[fw] = set()
+                if req:
+                    compliance_frameworks[fw].add(req)
+
+    evidence_count = result.get("compliance_evidence_count", 0)
+    if compliance_frameworks or evidence_count:
+        lines.append("### :page_facing_up: Compliance Impact\n")
+        if compliance_frameworks:
+            for fw, reqs in sorted(compliance_frameworks.items()):
+                req_str = ", ".join(sorted(reqs)) if reqs else "general"
+                lines.append(f"- **{fw}**: {req_str}")
+            lines.append("")
+        if evidence_count:
+            lines.append(f"_{evidence_count} audit-ready evidence document(s) generated._\n")
 
     # Escalation issues
     if escalations:

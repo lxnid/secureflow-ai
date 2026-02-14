@@ -14,6 +14,7 @@ from semantic_kernel.agents import ChatCompletionAgent
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
 
 from src.config import Settings
+from src.plugins.compliance_plugin import CompliancePlugin
 from src.plugins.fix_plugin import FixGeneratorPlugin
 from src.plugins.github_plugin import GitHubPlugin
 
@@ -67,7 +68,13 @@ For EACH prioritized finding:
    - Call `create_escalation_issue` to create a GitHub issue.
    - Add a note in the summary referencing the issue.
 
-5. **Post results to the PR:**
+5. **Generate compliance evidence:**
+   - For each fix (Tier 1 or Tier 2), call `generate_evidence` with the CWE ID,
+     finding title, severity, fix explanation, confidence, PR number, repo, and file path.
+   - This creates an audit-ready evidence document mapping the vulnerability to
+     compliance frameworks (SOC2, PCI-DSS, OWASP, HIPAA).
+
+6. **Post results to the PR:**
    - Collect all Tier 1 and Tier 2 fixes into a suggestions array.
    - Call `create_review_with_suggestions` to post inline code suggestions
      on the PR diff. Each suggestion must have:
@@ -99,7 +106,8 @@ Return a JSON object:
   ],
   "suggestions_posted": true,
   "escalation_issues": [],
-  "summary": "Generated 3 fixes: 1 auto-applicable, 1 review-required, 1 escalated."
+  "compliance_evidence_count": 2,
+  "summary": "Generated 3 fixes: 1 auto-applicable, 1 review-required, 1 escalated. 2 compliance evidence documents created."
 }
 ```
 
@@ -117,13 +125,15 @@ Return a JSON object:
 def create_remediation_agent(
     settings: Settings,
     github_plugin: GitHubPlugin | None = None,
+    cosmos_client=None,
 ) -> ChatCompletionAgent:
-    """Create the Remediation ChatCompletionAgent with fix and GitHub plugins.
+    """Create the Remediation ChatCompletionAgent with fix, GitHub, and compliance plugins.
 
     Args:
         settings: Application settings.
         github_plugin: Optional shared GitHubPlugin. If not provided,
             a new instance is created (caller is responsible for closing it).
+        cosmos_client: Optional Cosmos DB client for compliance evidence storage.
     """
     service = AzureChatCompletion(
         deployment_name=settings.azure_openai_deployment,
@@ -136,5 +146,9 @@ def create_remediation_agent(
         service=service,
         name="SecurityRemediation",
         instructions=REMEDIATION_SYSTEM_PROMPT,
-        plugins=[FixGeneratorPlugin(), github_plugin],
+        plugins=[
+            FixGeneratorPlugin(),
+            github_plugin,
+            CompliancePlugin(cosmos_client, settings.cosmos_database),
+        ],
     )

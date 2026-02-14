@@ -1,0 +1,38 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+
+# Docs (not needed in image)
+spec/
+*.md
+!README.md
+
+# Claude
+.claude/
+
+# Dashboard (separate deployment)
+dashboard/
+
+# Node modules (MCP servers install on-demand via npx)
+node_modules/
