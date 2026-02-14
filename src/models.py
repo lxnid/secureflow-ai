@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class Severity(StrEnum):
@@ -126,12 +126,13 @@ class Fix(BaseModel):
     fixed_code: str
     explanation: str
     confidence: float = Field(ge=0, le=1)
-    confidence_tier: ConfidenceTier = ConfidenceTier.ESCALATE
     is_valid: bool = False
     validation_errors: list[str] = []
 
-    def model_post_init(self, _context):
-        self.confidence_tier = ConfidenceTier.from_score(self.confidence)
+    @computed_field
+    @property
+    def confidence_tier(self) -> ConfidenceTier:
+        return ConfidenceTier.from_score(self.confidence)
 
 
 class PRSuggestion(BaseModel):

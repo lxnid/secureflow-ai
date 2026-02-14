@@ -4,6 +4,7 @@ All settings are loaded from environment variables.
 In production, inject via Azure Container Apps secrets or Key Vault.
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -29,5 +30,21 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     max_concurrent_analyses: int = 5
     agent_timeout_seconds: int = 45
+    github_api_timeout: float = 15.0
+    scanner_timeout: int = 30
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @field_validator("azure_openai_endpoint")
+    @classmethod
+    def validate_endpoint(cls, v: str) -> str:
+        if not v.startswith("https://"):
+            raise ValueError("azure_openai_endpoint must be an HTTPS URL")
+        return v.rstrip("/")
+
+    @field_validator("cosmos_endpoint")
+    @classmethod
+    def validate_cosmos_endpoint(cls, v: str) -> str:
+        if not v.startswith("https://"):
+            raise ValueError("cosmos_endpoint must be an HTTPS URL")
+        return v.rstrip("/")
