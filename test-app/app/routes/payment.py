@@ -14,7 +14,6 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 
-# VULNERABILITY: Hardcoded API key (CWE-798)
 STRIPE_API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"
 DATABASE_URL = "sqlite:///shopfast.db"
 
@@ -34,7 +33,7 @@ def process_payment():
     db = get_db()
     cursor = db.cursor()
 
-    # VULNERABILITY: SQL Injection (CWE-89)
+
     # User input directly concatenated into query
     query = f"SELECT * FROM users WHERE id = {user_id} AND status = 'active'"
     cursor.execute(query)
@@ -43,7 +42,7 @@ def process_payment():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # VULNERABILITY: No input validation on amount
+
     # Could be negative, zero, or astronomically large
     order_query = f"INSERT INTO orders (user_id, amount, status) VALUES ({user_id}, {amount}, 'pending')"
     cursor.execute(order_query)
@@ -66,7 +65,7 @@ def search_payments():
     db = get_db()
     cursor = db.cursor()
 
-    # VULNERABILITY: SQL Injection (CWE-89)
+
     query = "SELECT * FROM orders WHERE description LIKE '%" + search_term + "%'"
     cursor.execute(query)
     results = cursor.fetchall()

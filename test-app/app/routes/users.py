@@ -21,7 +21,7 @@ def get_avatar(user_id):
     """Serve user avatar image."""
     filename = request.args.get("file", "default.png")
 
-    # VULNERABILITY: Path Traversal (CWE-22)
+
     # User-controlled filename with no sanitization
     file_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -40,7 +40,7 @@ def register_user():
     password = data.get("password")
     email = data.get("email")
 
-    # VULNERABILITY: Weak password hashing (CWE-916)
+
     # MD5 is cryptographically broken — should use bcrypt or argon2
     password_hash = hashlib.md5(password.encode()).hexdigest()
 
@@ -59,7 +59,7 @@ def user_profile():
     """Render user profile page."""
     username = request.args.get("name", "Guest")
 
-    # VULNERABILITY: Reflected XSS (CWE-79)
+
     # User input directly injected into HTML without escaping
     html = f"""
     <html>
