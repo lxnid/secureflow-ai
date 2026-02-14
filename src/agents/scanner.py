@@ -71,16 +71,27 @@ Return a JSON object with this exact structure:
 """
 
 
-def create_scanner_agent(settings: Settings) -> ChatCompletionAgent:
-    """Create the Scanner ChatCompletionAgent with SAST plugins."""
+def create_scanner_agent(
+    settings: Settings,
+    github_plugin: GitHubPlugin | None = None,
+) -> ChatCompletionAgent:
+    """Create the Scanner ChatCompletionAgent with SAST plugins.
+
+    Args:
+        settings: Application settings.
+        github_plugin: Optional shared GitHubPlugin. If not provided,
+            a new instance is created (caller is responsible for closing it).
+    """
     service = AzureChatCompletion(
         deployment_name=settings.azure_openai_deployment,
         endpoint=settings.azure_openai_endpoint,
         api_key=settings.azure_openai_api_key,
     )
+    if github_plugin is None:
+        github_plugin = GitHubPlugin(settings.github_token)
     return ChatCompletionAgent(
         service=service,
         name="SecurityScanner",
         instructions=SCANNER_SYSTEM_PROMPT,
-        plugins=[SemgrepPlugin(), GitHubPlugin(settings.github_token)],
+        plugins=[SemgrepPlugin(), github_plugin],
     )

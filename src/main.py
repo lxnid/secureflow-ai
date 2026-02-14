@@ -17,6 +17,12 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
 from src.config import Settings
 
+# Cosmos DB import — used for the knowledge base (patterns, evidence)
+try:
+    from azure.cosmos.aio import CosmosClient
+except ImportError:
+    CosmosClient = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("secureflow")
 
 settings = Settings()
@@ -30,7 +36,27 @@ async def lifespan(app: FastAPI):
         format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
     )
     logger.info("SecureFlow AI starting up")
+
+    # Initialize Cosmos DB client for knowledge base (patterns, evidence)
+    cosmos_client = None
+    if CosmosClient and settings.cosmos_endpoint and settings.cosmos_key:
+        try:
+            cosmos_client = CosmosClient(
+                settings.cosmos_endpoint, {"masterKey": settings.cosmos_key},
+            )
+            logger.info("Cosmos DB client initialized")
+        except Exception as exc:
+            logger.warning("Failed to initialize Cosmos DB client: %s", exc)
+    app.state.cosmos_client = cosmos_client
+
     yield
+
+    # Clean up Cosmos DB client
+    if cosmos_client is not None:
+        try:
+            await cosmos_client.close()
+        except Exception:
+            pass
     logger.info("SecureFlow AI shutting down")
 
 
@@ -97,8 +123,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         pr_number, repo, action, head_sha[:8],
     )
 
-    # 6. Trigger pipeline in background
-    background_tasks.add_task(process_pr, repo, pr_number, head_sha)
+    # 6. Trigger pipeline in background (pass Cosmos client for knowledge base)
+    cosmos_client = getattr(request.app.state, "cosmos_client", None)
+    background_tasks.add_task(process_pr, repo, pr_number, head_sha, cosmos_client)
 
     return {
         "status": "accepted",
@@ -107,34 +134,36 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     }
 
 
-async def process_pr(repo: str, pr_number: int, head_sha: str) -> None:
-    """Run the multi-agent security review pipeline for a PR.
+async def process_pr(
+    repo: str, pr_number: int, head_sha: str, cosmos_client=None,
+) -> None:
+    """Run the full 3-agent security review pipeline for a PR.
 
-    Currently uses the Scanner Agent only (Sprint 1).
-    Sprint 2 will upgrade this to the full 3-agent orchestrator.
+    Pipeline: Scanner → Intelligence → Remediation
+    The Remediation Agent posts inline suggestions and comments directly
+    to the PR via its GitHubPlugin. If the pipeline fails, we post
+    a fallback error comment.
     """
-    from src.agents.scanner import create_scanner_agent
+    from src.orchestrator import SecurityReviewOrchestrator
     from src.plugins.github_plugin import GitHubPlugin
 
     start = time.monotonic()
-    github = GitHubPlugin(settings.github_token)
 
     try:
-        scanner = create_scanner_agent(settings)
-        task_message = (
-            f"Analyze pull request #{pr_number} in repository {repo}. "
-            f"The head commit SHA is {head_sha}. "
-            f"Scan all changed files for security vulnerabilities and return structured findings."
-        )
-
-        response = await scanner.get_response(messages=task_message)
+        orchestrator = SecurityReviewOrchestrator(settings, cosmos_client=cosmos_client)
+        result = await orchestrator.analyze_pr(repo, pr_number, head_sha)
         duration = time.monotonic() - start
 
-        logger.info("Scanner completed for PR #%d in %.1fs", pr_number, duration)
+        logger.info(
+            "Pipeline completed for PR #%d in %.1fs (mode=%s)",
+            pr_number, duration, result.get("orchestration_mode", "unknown"),
+        )
 
-        # Post findings to PR as a comment
-        comment_body = _format_scanner_comment(response.content, duration)
-        await github.post_summary_comment(repo, pr_number, comment_body)
+        # The Remediation Agent already posts inline suggestions to the PR.
+        # Post a summary comment with the full report as well.
+        async with GitHubPlugin(settings.github_token) as github:
+            comment_body = _format_pipeline_comment(result, duration)
+            await github.post_summary_comment(repo, pr_number, comment_body)
 
     except Exception:
         duration = time.monotonic() - start
@@ -142,44 +171,23 @@ async def process_pr(repo: str, pr_number: int, head_sha: str) -> None:
 
         # Post error comment so the developer isn't left waiting
         try:
-            await github.post_summary_comment(
-                repo,
-                pr_number,
-                (
-                    "## :rotating_light: SecureFlow AI — Analysis Error\n\n"
-                    "An error occurred while analyzing this pull request. "
-                    "The security team has been notified.\n\n"
-                    f"_Analysis duration: {duration:.1f}s_"
-                ),
-            )
+            async with GitHubPlugin(settings.github_token) as github:
+                await github.post_summary_comment(
+                    repo,
+                    pr_number,
+                    (
+                        "## :rotating_light: SecureFlow AI — Analysis Error\n\n"
+                        "An error occurred while analyzing this pull request. "
+                        "The security team has been notified.\n\n"
+                        f"_Analysis duration: {duration:.1f}s_"
+                    ),
+                )
         except Exception:
             logger.exception("Failed to post error comment on PR #%d", pr_number)
-    finally:
-        await github.aclose()
 
 
-def _format_scanner_comment(scanner_output: str, duration: float) -> str:
-    """Format Scanner Agent output as a GitHub PR comment."""
-    # Try to parse as JSON for structured formatting
-    try:
-        data = json.loads(scanner_output)
-        findings = data.get("findings", [])
-    except (json.JSONDecodeError, TypeError):
-        # If not valid JSON, post the raw output
-        return (
-            "## :shield: SecureFlow AI — Security Intelligence Report\n\n"
-            f"{scanner_output}\n\n"
-            f"_Analysis completed in {duration:.1f}s_"
-        )
-
-    if not findings:
-        return (
-            "## :white_check_mark: SecureFlow AI — Security Intelligence Report\n\n"
-            f"**No security issues found** in {data.get('files_scanned', 'the')} scanned files.\n\n"
-            f"_Analysis completed in {duration:.1f}s_"
-        )
-
-    # Build structured report
+def _format_pipeline_comment(result: dict, duration: float) -> str:
+    """Format the full pipeline result as a GitHub PR comment."""
     severity_icons = {
         "CRITICAL": ":red_circle:",
         "HIGH": ":orange_circle:",
@@ -187,31 +195,106 @@ def _format_scanner_comment(scanner_output: str, duration: float) -> str:
         "LOW": ":white_circle:",
     }
 
+    # Handle unparseable output
+    if result.get("parse_error"):
+        raw = result.get("raw_output", "")
+        return (
+            "## :shield: SecureFlow AI — Security Intelligence Report\n\n"
+            f"{raw[:3000]}\n\n"
+            f"_Analysis completed in {duration:.1f}s_"
+        )
+
+    # Extract data from orchestrator result
+    fixes = result.get("fixes", [])
+    summary = result.get("summary", "")
+    escalations = result.get("escalation_issues", [])
+    mode = result.get("orchestration_mode", "unknown")
+
+    # Also handle results that come through in the _raw_stages format
+    prioritized = []
+    raw_stages = result.get("_raw_stages", {})
+    if raw_stages.get("intelligence"):
+        try:
+            intel_data = json.loads(raw_stages["intelligence"])
+            prioritized = intel_data.get("prioritized_findings", [])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # If we have no structured data at all, use the summary
+    if not fixes and not prioritized and not summary:
+        return (
+            "## :white_check_mark: SecureFlow AI — Security Intelligence Report\n\n"
+            "**No actionable security issues found.**\n\n"
+            f"_Analysis completed in {duration:.1f}s | "
+            f"Pipeline mode: {mode} | Powered by SecureFlow AI_"
+        )
+
     lines = [
         "## :shield: SecureFlow AI — Security Intelligence Report\n",
-        f"**{len(findings)} security issue(s) detected** "
-        f"in {data.get('files_scanned', '?')} scanned files.\n",
-        "| Severity | Finding | Location |",
-        "|----------|---------|----------|",
     ]
 
-    for f in findings:
-        icon = severity_icons.get(f.get("severity", "MEDIUM"), ":white_circle:")
-        title = f.get("title", "Unknown")
-        file_path = f.get("file_path", "?")
-        line = f.get("line_start", "?")
-        lines.append(f"| {icon} **{f.get('severity', '?')}** | {title} | `{file_path}:{line}` |")
+    # Fixes summary table
+    if fixes:
+        tier_counts = {"auto_apply": 0, "review_required": 0, "escalate": 0}
+        for fix in fixes:
+            tier = fix.get("tier", "escalate")
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
-    lines.append("")
+        lines.append(f"**{len(fixes)} fix(es) generated** | ")
+        parts = []
+        if tier_counts["auto_apply"]:
+            parts.append(f":white_check_mark: {tier_counts['auto_apply']} auto-applicable")
+        if tier_counts["review_required"]:
+            parts.append(f":warning: {tier_counts['review_required']} review required")
+        if tier_counts["escalate"]:
+            parts.append(f":rotating_light: {tier_counts['escalate']} escalated")
+        lines[-1] += " | ".join(parts)
+        lines.append("")
 
-    # Detailed findings
-    for i, f in enumerate(findings, 1):
-        lines.append(f"### {i}. {f.get('title', 'Finding')}")
-        lines.append(f"**Severity:** {f.get('severity', '?')} | **CWE:** {f.get('cwe_id', '?')} | **Type:** {f.get('vuln_type', '?')}\n")
-        lines.append(f"{f.get('description', '')}\n")
-        if f.get("code_snippet"):
-            lines.append(f"```\n{f['code_snippet']}\n```\n")
+        lines.extend(["| Severity | Finding | Confidence | Action |", "|----------|---------|------------|--------|"])
+        for fix in fixes:
+            severity = fix.get("severity", "MEDIUM").upper()
+            icon = severity_icons.get(severity, ":white_circle:")
+            file_path = fix.get("file_path", "?")
+            confidence = fix.get("confidence", 0)
+            tier = fix.get("tier", "escalate")
+            tier_label = {"auto_apply": "Auto-Apply", "review_required": "Review", "escalate": "Escalated"}.get(tier, tier)
+            lines.append(
+                f"| {icon} **{severity}** | `{file_path}` | {confidence:.0%} | {tier_label} |"
+            )
+        lines.append("")
 
-    lines.append(f"\n_Analysis completed in {duration:.1f}s | Powered by SecureFlow AI_")
+    # Prioritized findings detail (from intelligence stage)
+    if prioritized:
+        lines.append("### Prioritized Findings\n")
+        for i, pf in enumerate(prioritized, 1):
+            finding = pf.get("finding", pf)
+            risk = pf.get("risk_score", {})
+            impact = pf.get("business_impact", "")
+            title = finding.get("title", "Finding")
+            severity = finding.get("severity", "?")
+            cwe = finding.get("cwe_id", "?")
+            score = risk.get("composite_score", "?")
+            lines.append(f"**{i}. {title}** — {severity} | {cwe} | Risk: {score}/10")
+            if impact:
+                lines.append(f"> {impact}")
+            lines.append("")
+
+    # Escalation issues
+    if escalations:
+        lines.append("### :rotating_light: Escalated Issues\n")
+        for esc in escalations:
+            lines.append(f"- [{esc}]({esc})")
+        lines.append("")
+
+    # Summary
+    if summary:
+        lines.append(f"---\n{summary}\n")
+
+    lines.append(
+        f"_Analysis completed in {duration:.1f}s | "
+        f"Pipeline: 3-agent sequential ({mode}) | "
+        f"Powered by SecureFlow AI_"
+    )
 
     return "\n".join(lines)
