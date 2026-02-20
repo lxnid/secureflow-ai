@@ -74,30 +74,33 @@ For EACH prioritized finding:
    - This creates an audit-ready evidence document mapping the vulnerability to
      compliance frameworks (SOC2, PCI-DSS, OWASP, HIPAA).
 
-6. **Post results to the PR:**
-   - Collect all Tier 1 and Tier 2 fixes into a suggestions array.
-   - Call `create_review_with_suggestions` to post inline code suggestions
-     on the PR diff. Each suggestion must have:
-     - path: file path
-     - start_line / end_line: the lines to replace
-     - fixed_code: the replacement code
-     - explanation: what was changed and why
-     - severity: from the original finding
-     - confidence: from assess_confidence
-   - Call `post_summary_comment` with a Security Intelligence Report
-     summarizing all findings, fixes, and their confidence tiers.
+6. **MANDATORY — Post results to the PR (YOU MUST DO THIS):**
+   - Collect ALL Tier 1 and Tier 2 fixes into a JSON array.
+   - YOU MUST call `create_review_with_suggestions` with:
+     - repo: from the PR Context block
+     - pr_number: from the PR Context block
+     - commit_sha: from the PR Context block
+     - suggestions_json: a JSON array where each item has:
+       - path: file path (e.g., "test_vulnerable.py")
+       - start_line / end_line: exact line numbers of the vulnerable code
+       - fixed_code: the replacement code (just the code, no markdown)
+       - explanation: what was changed and why
+       - severity: from the original finding
+       - confidence: from assess_confidence (as a float, e.g. 0.93)
+   - This is NOT optional. If you have any fixes, you MUST call this tool.
+   - DO NOT just describe the fix in text — you MUST use the tool to post it inline.
 
 ## Output Format
 
-Return a JSON object:
+After calling the tools above, return ONLY this JSON object (no other text):
 ```json
 {
   "fixes": [
     {
-      "finding_id": "...",
-      "file_path": "app/routes/payment.py",
+      "file_path": "test_vulnerable.py",
       "vuln_type": "sql_injection",
-      "fixed_code": "cursor.execute(\\"SELECT * FROM users WHERE id = %s\\", (user_id,))",
+      "severity": "CRITICAL",
+      "fixed_code": "cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))",
       "explanation": "Replaced string concatenation with parameterized query",
       "confidence": 0.93,
       "tier": "auto_apply",
@@ -106,19 +109,21 @@ Return a JSON object:
   ],
   "suggestions_posted": true,
   "escalation_issues": [],
-  "compliance_evidence_count": 2,
-  "summary": "Generated 3 fixes: 1 auto-applicable, 1 review-required, 1 escalated. 2 compliance evidence documents created."
+  "compliance_evidence_count": 0,
+  "summary": "Generated 3 fixes: 1 auto-applicable, 1 review-required, 1 escalated."
 }
 ```
+
+CRITICAL: Your final message MUST be ONLY the JSON above. Do not include any
+text before or after the JSON. Do not wrap it in markdown code blocks.
 
 ## Rules
 - Always validate fixes before posting — never post invalid code.
 - Always include an explanation with each fix.
 - Use the team's preferred fix pattern when available.
-- For Tier 3 escalations, provide a detailed description in the GitHub issue
-  explaining the vulnerability, why the fix is uncertain, and what an expert
-  should look for.
-- The summary comment should be posted AFTER the inline suggestions.
+- YOU MUST call `create_review_with_suggestions` before returning your final JSON.
+- DO NOT skip calling the tool. DO NOT just return text describing the fix.
+- For Tier 3 escalations, call `create_escalation_issue` to create a GitHub issue.
 """
 
 

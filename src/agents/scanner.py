@@ -63,9 +63,14 @@ Return a JSON object with this exact structure:
 ```
 
 ## Rules
+- ALWAYS call `run_sast_scan` on EVERY source code file — NEVER skip a file without scanning it.
+- Even if you think the code looks safe, ALWAYS run the scan — let Semgrep decide.
 - Only include findings with severity CRITICAL, HIGH, or MEDIUM. Skip INFO/LOW.
 - Deduplicate findings — if Semgrep reports the same issue twice, include it only once.
 - For each finding, include the exact code snippet that is vulnerable.
+- If Semgrep returns zero findings but you see obvious vulnerabilities in the code
+  (SQL injection, command injection, hardcoded secrets, etc.), report them manually
+  with tool="manual_review" — do NOT silently skip them.
 - If a tool returns an error, note it in the summary but continue scanning other files.
 - If no vulnerabilities are found, return: {"findings": [], "files_scanned": N, "summary": "No security issues found."}
 """
