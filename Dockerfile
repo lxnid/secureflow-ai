@@ -17,8 +17,9 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dashboard]" \
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir ".[dashboard]" \
     && pip install --no-cache-dir semgrep
 
 # ── Stage 2: Runtime ───────────────────────────────────────────
@@ -49,10 +50,10 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 
 # Copy application code (NO .env or secrets)
 COPY src/ ./src/
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 
-# Install the project itself (editable install already has deps)
-RUN pip install --no-cache-dir --no-deps -e .
+# Install the project itself (deps already copied from build stage)
+RUN pip install --no-cache-dir --no-deps .
 
 # Non-root user
 USER secureflow
