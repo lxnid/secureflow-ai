@@ -58,17 +58,18 @@ class SecurityReviewOrchestrator:
             span.set_attribute("pr.number", pr_number)
             span.set_attribute("pr.head_sha", head_sha)
 
-            # Try Option A first, fall back to Option B
+            # Manual chaining is more reliable (explicit stage-to-stage data flow).
+            # SequentialOrchestration is experimental and may produce serialization errors.
             try:
-                result = await self._run_sequential_orchestration(repo, pr_number, head_sha)
-                result["orchestration_mode"] = "sequential"
-            except Exception as e:
-                logger.warning(
-                    "SequentialOrchestration failed (%s), falling back to manual chaining",
-                    e,
-                )
                 result = await self._run_manual_chaining(repo, pr_number, head_sha)
                 result["orchestration_mode"] = "manual"
+            except Exception as e:
+                logger.warning(
+                    "Manual chaining failed (%s), falling back to SequentialOrchestration",
+                    e,
+                )
+                result = await self._run_sequential_orchestration(repo, pr_number, head_sha)
+                result["orchestration_mode"] = "sequential"
 
             result["duration_seconds"] = round(time.monotonic() - start, 1)
             result["repo"] = repo
