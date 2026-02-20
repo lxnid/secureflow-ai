@@ -55,6 +55,10 @@ COPY pyproject.toml README.md ./
 # Install the project itself (deps already copied from build stage)
 RUN pip install --no-cache-dir --no-deps .
 
+# Create npm cache dir for non-root user (needed for MCP server via npx)
+RUN mkdir -p /app/.npm /tmp/semgrep \
+    && chown -R secureflow:secureflow /app /tmp/semgrep
+
 # Non-root user
 USER secureflow
 
