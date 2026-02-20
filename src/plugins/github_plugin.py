@@ -215,7 +215,11 @@ class GitHubPlugin:
 
         comments = []
         for s in suggestions:
-            confidence = s.get("confidence", 0)
+            try:
+                confidence = float(s.get("confidence", 0.0))
+            except (ValueError, TypeError):
+                confidence = 0.0
+                
             severity = s.get("severity", "MEDIUM")
 
             # Build the suggestion body with confidence badge
